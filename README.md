@@ -95,9 +95,14 @@ nohup step1_fitNULLGLMM.R     \
 SPA tests were run on imputed chromosome 10 first. (GPU02)
 
 ### Current progress
+
 ![image](https://user-images.githubusercontent.com/22064612/127957803-f1f8ae0a-bc21-4e51-ad8e-51cf97ef1184.png)
 
 ### Comparing pvalues with pheweb results
 From up to estimated markers, simple comparison was made with pheweb gwas summary
-![image](https://user-images.githubusercontent.com/22064612/127957963-27fe990c-2754-42fe-8274-8e51c65aa524.png)
+
+![comparison_plot](https://user-images.githubusercontent.com/22064612/127958186-415758c8-c9e2-4d69-a2e7-3d9ec1df70fc.png)
+
+
+
 

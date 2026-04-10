@@ -52,13 +52,80 @@ Implemented as `estimate_yty_over_n()` in preprocessing.py, auto-invoked in cova
 
 The ~1.88× scaling between pipeline and RareEffect effect sizes is explained by phenotype variance: SAIGE uses σ_Y² ≈ 1.028, RareEffect uses GLMM residuals σ² ≈ 0.292. The ratio sqrt(1.028/0.292) = 1.876 matches perfectly.
 
-### 6. MAF-Weighted Shrinkage (Explored, Not Effective)
+### 6. MAF-Weighted Shrinkage (Explored, Not Effective on Correlation Scale)
 
 Attempted two approaches to fix HEELS correlation-scale ranking:
 - **Data rescaling** (W^{1/2} L W^{1/2}, W^{1/2} z): crushed rare variant effects to zero
 - **Penalty-only** ((L + λW^{-1})^{-1} z): Spearman stuck at 0.479 regardless of γ
 
 Neither fixes the fundamental rank distortion because the z-scores and LD on the correlation scale already encode the wrong signal structure. **Profile-LL on the covariance scale is the correct approach.**
+
+MAF-weighted penalty is available via `--maf-weights GAMMA` for correlation-mode HEELS.
+
+### 7. G'G Matrix Differences: SAIGE LD vs Plink Genotypes
+
+Direct comparison of the collapsed LoF G'G (11×11) between SAIGE step3 LD and RareEffect's plink-derived G'G revealed critical discrepancies in two overlapping indel variants:
+
+#### G'G matrix comparison (APOB LoF)
+
+| Variant | SAIGE G'G diag | RareEffect G'G diag | Match |
+|---|---|---|---|
+| COLLAPSED (carrier) | 223 | 223 | Yes |
+| 2:21006019:CA:C | 54 | 54 | Yes |
+| 2:21006087:C:T | 17 | 17 | Yes |
+| 2:21006629:AG:A | 16 | 16 | Yes |
+| 2:21009304:G:A | 17 | 17 | Yes |
+| 2:21010615:G:A | 13 | 13 | Yes |
+| 2:21011300:AAC:A | 24 | 24 | Yes |
+| 2:21032391:G:A | 41 | 41 | Yes |
+| 2:21038086:C:A | 13 | 13 | Yes |
+| **2:21043917:GC:G** | **322** | **316** | **No (+6)** |
+| **2:21043920:AGCAGCGCG:A** | **323** | **303** | **No (+20)** |
+
+| Off-diagonal | SAIGE | RareEffect | Cauchy-Schwarz bound |
+|---|---|---|---|
+| **(21043917, 21043920)** | **321** | **299** | 322.5 (SAIGE) / 309.2 (RE) |
+
+These two variants are overlapping indels 3bp apart. SAIGE's dosage-based LD inflates their diagonals and cross-product compared to plink hard-call genotypes. This is the **dominant source** of the remaining h2 discrepancy.
+
+#### Impact on h2 (Profile-LL, same scores, different G'G)
+
+| G'G source | LoF h2 | vs RareEffect |
+|---|---|---|
+| SAIGE step3 LD | 2.05e-02 | 1.16× |
+| **RareEffect plink G'G** | **1.78e-02** | **1.01×** |
+| RareEffect reference | 1.77e-02 | 1.00× |
+
+With RareEffect's own G'G, the pipeline matches within 1%.
+
+#### Impact on HEELS (correlation scale)
+
+| G'G source | LoF Pearson | LoF Spearman |
+|---|---|---|
+| SAIGE step3 LD | 0.501 | 0.479 |
+| **RareEffect plink G'G** | **0.889** | **0.915** |
+
+The LoF rank distortion (Spearman 0.48) was **not inherent to the correlation scale** — it was caused by the inflated off-diagonal between the two indels in SAIGE's LD.
+
+### 8. G'G Stabilisation
+
+Implemented `stabilize_gtg()` with three rules to mitigate G'G artifacts from summary statistics:
+
+| Rule | Description | Parameter |
+|---|---|---|
+| **Rule 2** | Diagonal normalisation: replace G'G_jj with n·2p(1-p) where within 2× of expected (skip collapsed groups) | `--stabilize-gtg` |
+| **Rule 3** | Off-diagonal shrinkage: Λ_reg = (1-ρ)Λ + ρ·diag(Λ) | `--gtg-ld-shrinkage RHO` (default 0.01) |
+| **Rule 4** | Outlier pair clipping: cap \|Λ_ij / √(Λ_ii Λ_jj)\| at τ | `--gtg-outlier-clip TAU` (default 0.95) |
+
+#### Stabilisation results (APOB, Profile-LL, yty=1.028, binary collapse)
+
+| Annotation | No stabilisation | With stabilisation | RareEffect | Stabilised ratio |
+|---|---|---|---|---|
+| LoF | 2.06e-02 (1.16×) | **1.60e-02 (0.91×)** | 1.77e-02 | ↓ closer |
+| Missense | 9.54e-03 (0.93×) | **9.14e-03 (0.89×)** | 1.03e-02 | ↓ modest |
+| Synonymous | 1.28e-03 (1.89×) | 1.22e-03 (1.81×) | 6.76e-04 | ↓ minimal |
+
+For LoF: 1 outlier pair clipped (21043917/21043920), 10/11 diagonals corrected. The h2 drops from 1.16× to 0.91× of RareEffect — a significant improvement from stabilising the two problematic indels.
 
 ---
 
@@ -82,24 +149,44 @@ Neither fixes the fundamental rank distortion because the z-scores and LD on the
 | `run_fastlmm_sumstats()` | `meta_rvprs_fixed.py` | Profile-likelihood MLE from scores + G'G |
 | `estimate_yty_over_n()` | `preprocessing.py` | Auto-estimate σ_Y² from Var(U)/G'G_diag |
 | Auto-detect LD symmetry | `preprocessing.py` | `_is_symmetric_csr()`, default `symmetrize=None` |
-| MAF-weighted penalty | `meta_rvprs_fixed.py` | `weights` parameter in `heels_blup_and_trace()` / `run_heels()` |
+| MAF-weighted penalty | `meta_rvprs_fixed.py` | `--maf-weights GAMMA` for correlation-mode HEELS |
+| G'G stabilisation | `preprocessing.py` | `stabilize_gtg()` with diagonal correction, LD shrinkage, outlier clipping |
 
 ---
 
-## Final APOB Results (Profile-LL, yty=1.028, binary collapse)
+## Final APOB Results
 
-| Annotation | Pipeline h2 | RareEffect h2 | Ratio | Pearson r(β) | Spearman r(β) |
-|---|---|---|---|---|---|
-| LoF | 2.06e-02 | 1.77e-02 | 1.16 | 0.869 | **0.988** |
-| Missense | 9.54e-03 | 1.03e-02 | 0.93 | **0.997** | **0.994** |
-| Synonymous | 1.28e-03 | 6.76e-04 | 1.89 | 0.889 | 0.953 |
+### Profile-LL (covariance mode, yty=1.028, binary collapse, with stabilisation)
+
+| Annotation | Pipeline h2 | RareEffect h2 | Ratio |
+|---|---|---|---|
+| LoF | 1.60e-02 | 1.77e-02 | 0.91 |
+| Missense | 9.14e-03 | 1.03e-02 | 0.89 |
+| Synonymous | 1.22e-03 | 6.76e-04 | 1.81 |
+
+### Effect size correlation (Profile-LL, no stabilisation, yty=1.028)
+
+| Annotation | n variants | Pearson | Spearman |
+|---|---|---|---|
+| LoF | 10 | 0.869 | **0.988** |
+| Missense | 331 | **0.997** | **0.994** |
+| Synonymous | 143 | 0.889 | 0.953 |
+
+### Three-method comparison (effect size correlation vs RareEffect)
+
+| | RE vs Profile-LL | RE vs HEELS | RE vs HEELS+MAF(γ=1) |
+|---|---|---|---|
+| LoF Pearson | **0.869** | 0.501 | 0.432 |
+| LoF Spearman | **0.988** | 0.479 | 0.479 |
+| Missense Pearson | **0.997** | 0.902 | 0.876 |
+| Missense Spearman | **0.994** | 0.979 | 0.965 |
 
 ---
 
 ## Usage
 
 ```bash
-# RareEffect-aligned mode (recommended for rare variant h2)
+# Recommended: covariance mode with stabilisation
 python -m rvprs_pipeline.run_rvprs_pipeline \
   --gene APOB \
   --groupfile ... \
@@ -108,17 +195,25 @@ python -m rvprs_pipeline.run_rvprs_pipeline \
   --ld ... \
   --outdir results/ \
   --genotype-scale covariance \
-  --binary-collapse
+  --binary-collapse \
+  --stabilize-gtg
 
 # yty_over_n is auto-estimated from Var(U)/G'G_diag
 # LD symmetry is auto-detected (no --symmetrize-ld needed)
+# G'G stabilisation: diag correction + 1% LD shrinkage + 0.95 outlier clip
+
+# Correlation mode with MAF weights (alternative)
+python -m rvprs_pipeline.run_rvprs_pipeline \
+  --gene APOB ... \
+  --genotype-scale correlation \
+  --maf-weights 1.0
 ```
 
 ---
 
 ## Files Modified
 
-- `rvprs_pipeline/preprocessing.py` — CollapsedInputs.collapsed_gtg, estimate_yty_over_n(), auto-detect symmetry, per-variant N, binary collapse for G'G, build_heels_inputs covariance mode
+- `rvprs_pipeline/preprocessing.py` — CollapsedInputs.collapsed_gtg, estimate_yty_over_n(), stabilize_gtg(), auto-detect symmetry, per-variant N, binary collapse for G'G, build_heels_inputs covariance mode + stabilisation params
 - `rvprs_pipeline/meta_rvprs_fixed.py` — run_fastlmm_sumstats(), MAF-weighted penalty in heels_blup_and_trace()
-- `rvprs_pipeline/run_rvprs_pipeline.py` — --genotype-scale, auto yty estimation, genotype_scale passthrough
-- `rvprs_pipeline/pipeline_mathematics.md` — full mathematical documentation (new file)
+- `rvprs_pipeline/run_rvprs_pipeline.py` — --genotype-scale, --maf-weights, --stabilize-gtg, --gtg-ld-shrinkage, --gtg-outlier-clip, auto yty estimation
+- `rvprs_pipeline/pipeline_mathematics.md` — full mathematical documentation with code cross-references

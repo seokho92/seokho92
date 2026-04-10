@@ -16,7 +16,15 @@ $$U_j = \sum_k U_j^{(k)}, \quad V_j = \sum_k V_j^{(k)}, \quad \Lambda = \sum_k \
 
 Allele frequency is $N$-weighted: $\hat{p}_j = \sum_k n_{k,j} p_j^{(k)} / \sum_k n_{k,j}$.
 
-**LD symmetry detection:** SAIGE step3 LD files store both triangles $(i,j,v)$ and $(j,i,v)$. The pipeline auto-detects this and skips symmetrisation to avoid doubling off-diagonal entries.
+**Code:** `preprocessing.py:integrate_summaries()` (lines 260–363)
+- Scores summed: `u_sum[idx] += summary_df['Tstat']` (line 310)
+- Variances summed: `v_sum[idx] += summary_df['var']` (line 311)
+- LD summed: `ld_sum = ld_sum + ld_part` (line 337)
+- AF N-weighted: `nw_af_sum[idx] += n * af` (line 321), then `AF = nw_af_sum / n_sum` (line 351)
+- $n$: `n = max(N_sum)` across variants (used as `n_scalar` in downstream)
+- Markers with zero G'G diagonal dropped (lines 340–344)
+
+**LD symmetry detection:** SAIGE step3 LD files store both triangles $(i,j,v)$ and $(j,i,v)$. The pipeline auto-detects this via `_is_symmetric_csr()` (lines 214–221) and skips symmetrisation to avoid doubling off-diagonal entries. Controlled by `load_ld_coo(..., symmetrize=None)` (lines 224–244). Default: auto-detect.
 
 ---
 
@@ -30,13 +38,32 @@ $$U_c = C\, U, \quad \Lambda_c = C\, \Lambda\, C^\top$$
 
 For the collapsed group (row 0 of $C$), the entry is $\sum_j G_j$ over the rare variant set.
 
-**Binary collapse** (`--binary-collapse`): RareEffect caps collapsed genotypes at 1 (carrier indicator). At the summary-stat level, the collapsed row/column of $\Lambda_c$ is rescaled so that $\Lambda_{c,00} \approx \text{MAC}_{\text{total}}$ (number of carriers) rather than the additive sum-of-crossproducts.
+**Code:** `preprocessing.py:process_genetic_data()` (lines 479–586)
+- MAC computed: `mac = 2 * N * maf` (line 516)
+- Collapse indices: `idx_collapse = np.where(mac < mac_threshold)` (line 517)
+- Collapse matrix $C$: `get_collapsing_matrix_py()` (line 520, defined lines 401–417)
+- Score collapsing: `u_c = collapse_matrix @ u` (line 522)
+- G'G collapsing: `collapsed_gtg = collapse_matrix @ ld_matrix @ collapse_matrix.T` (line 528)
+- Collapsed MAF: N-weighted `sum(maf * n) / sum(n)` (lines 560–561)
+
+**Binary collapse** (`--binary-collapse`): RareEffect caps collapsed genotypes at 1 (carrier indicator). At the summary-stat level, the collapsed row/column of both $\Phi_c$ and $\Lambda_c$ are rescaled so that the diagonal $\approx \text{MAC}_{\text{total}}$ (number of carriers) rather than the additive sum-of-crossproducts.
+
+**Code:** `preprocessing.py:_apply_binary_collapse_adjustment()` (lines 434–476)
+- Ratio: `binary_var_ratio = mac_total / gtg_additive_diag` (line 470)
+- Scale factor: `alpha = sqrt(binary_var_ratio)` (line 475)
+- Applied to both phi (line 539–541) and gtg (lines 546–548)
 
 ### 2.2 Genotype Variance (per-variant N correction)
 
 The genotype variance is computed using per-variant sample sizes $n_j$ for the diagonal, falling back to $n = \max_j n_j$ for off-diagonal normalisation:
 
 $$\text{Var}(G_j) = \frac{\Lambda_{jj}}{n_j} - (2\hat{p}_j)^2$$
+
+**Code:** `preprocessing.py:get_cor_sparse_py()` (lines 366–383)
+- Per-variant N passed: `n_per_variant` parameter (line 367)
+- Diagonal uses per-variant N: `n_diag = n_per_variant if n_per_variant is not None else n` (line 376)
+- Off-diagonal normalised by scalar $n$: `first = (var_div_sparse @ gtg_sparse @ var_div_sparse) / n` (line 381)
+- Called with per-variant N from `process_genetic_data()`: line 508
 
 ### 2.3 Score Statistic Covariance (phi)
 
@@ -50,11 +77,23 @@ $$\Phi_c = C\, \Phi_1\, C^\top - (C\, \Phi_2)(C\, \Phi_2)^\top$$
 
 This gives $\Phi_c \approx n\, \sigma_Y^2\, \text{Cov}(G_c)$, the score statistic covariance.
 
+**Code:** `preprocessing.py:process_genetic_data()` (lines 512–525)
+- `cor_g = cor_s['First']` ← $D \Lambda D / n$ (line 509, from `get_cor_sparse_py`)
+- `mean_adj = cor_s['Second_Vec']` ← $2\hat{p}_j / \sqrt{\text{Var}(G_j)}$ (line 510)
+- `phi_w1 = dmat @ cor_g @ dmat` ← $\Phi_1 = D_U \cdot (D\Lambda D/n) \cdot D_U$ (line 513)
+- `phi_w2 = mean_adj * sd_u` ← $\Phi_2$ (line 514)
+- `collapsed_phi = phi_c_w1 - outer(phi_c_w2, phi_c_w2)` ← $\Phi_c$ (line 525)
+
 ### 2.4 Genotype Correlation
 
 $$R = D_\Phi^{-1}\, \Phi_c\, D_\Phi^{-1}, \quad D_\Phi = \text{diag}(\sqrt{\text{diag}(\Phi_c)})$$
 
 This recovers $R \approx \text{Cor}(G_c)$, the genotype correlation matrix.
+
+**Code:** `preprocessing.py:covariance_to_correlation()` (lines 386–399)
+- `inv_sd = 1 / sqrt(variances)` (line 391)
+- `corr = dmat @ cov_sparse @ dmat` (line 393)
+- Called at line 580: `collapsed_corr = covariance_to_correlation(collapsed_phi)`
 
 ---
 
@@ -68,7 +107,13 @@ $$\hat\sigma_Y^2 = \text{median}_j \frac{V_j}{\Lambda_{jj}}$$
 
 The median is taken over variants with $\Lambda_{jj} > 10$ to exclude ultra-rare variants with unstable estimates. Empirically this gives tight IQR (e.g., $[1.027, 1.028]$ for APOB).
 
-**Note:** The HEELS-literature formula $\text{mean}(\hat\beta_j^2 + \text{SE}_j^2 \cdot n)$ is designed for common-variant GWAS with standardised genotypes and does **not** apply to rare variants, where $V_j$ varies by orders of magnitude across allele frequencies.
+**Code:** `preprocessing.py:estimate_yty_over_n()` (lines 614–633)
+- Ratio: `ratios = var_u[mask] / gtg_diag[mask]` (line 629)
+- Filter: `mask = (gtg_diag > min_gtg_diag) & (var_u > 0)` (line 625)
+- Median: `yty = float(np.median(ratios))` (line 630)
+- Auto-invoked in `run_rvprs_pipeline.py:main()` (lines 171–173) when `--genotype-scale covariance` and `--yty-over-n` not provided
+
+**Note:** The HEELS-literature formula $\text{mean}(\hat\beta_j^2 + \text{SE}_j^2 \cdot n)$ is designed for common-variant GWAS with standardised genotypes ($\Lambda_{jj} \approx n$) and does **not** apply to rare variants, where $\Lambda_{jj}$ varies by orders of magnitude across allele frequencies.
 
 ---
 
@@ -82,6 +127,11 @@ $$z_m = \frac{U_c}{\sqrt{V_c}} \cdot \sqrt{\frac{n}{m}}, \quad L = R \cdot \frac
 
 where $V_c = \text{diag}(\Phi_c)$ are exact collapsed score variances.
 
+**Code:** `preprocessing.py:build_heels_inputs()` (lines 669–683)
+- z-score: `z_m = collapsed_score / sqrt(collapsed_var_exact)` (line 672)
+- Scaled: `z_m = z_m * sqrt(n / m)` (line 673)
+- LD: `ld_corr = ld_corr * n / m` (line 677)
+
 **Model:**
 
 $$z_m = L\, \alpha + \varepsilon, \quad \alpha \sim \mathcal{N}(0,\, \sigma_g\, I_m), \quad \varepsilon \sim \mathcal{N}(0,\, \sigma_e\, L)$$
@@ -90,11 +140,24 @@ The eigendecomposition $L = Q\, \text{diag}(d)\, Q^\top$ gives:
 
 $$\hat\alpha = Q\, \text{diag}\!\left(\frac{1}{d_j + \lambda}\right) Q^\top z_m, \quad \lambda = \frac{\sigma_e}{\sigma_g}$$
 
+**Code:** `meta_rvprs_fixed.py:heels_blup_and_trace()` (lines 58–90)
+- Projection: `es = ld.eigvec.T @ z_m` (line 73)
+- Denominator: `denom = lam + ld.eigval` (line 81)
+- BLUP: `beta_hat = ld.eigvec @ (es / denom)` (lines 83–84)
+
 **EM updates** (iterate until convergence):
 
 $$\sigma_g^{(\text{new})} = \frac{\|\hat\alpha\|^2}{m - \text{tr}\!\left((L + \lambda I)^{-1}\right)}, \quad \sigma_e^{(\text{new})} = \frac{Y^\top Y}{n} - \frac{z_m^\top \hat\alpha}{n}$$
 
 When $Y^\top Y / n$ is unknown, renormalization forces $\sigma_g + \sigma_e = 1$.
+
+**Code:** `meta_rvprs_fixed.py:run_heels()` (lines 93–178)
+- Lambda: `lam = sigma_e / sigma_g` (line 133)
+- sigma_g update: `sigma_g_new = sum(beta_hat**2) / (m - trace_winv)` (lines 136–137)
+- sigma_e update: `sigma_e_new = yty_over_n - (z_m @ beta_hat) / n` (line 138)
+- Renormalize: `sigma_g_new /= total; sigma_e_new /= total` (lines 142–145)
+- Trace: `trace_winv = sum(1 / denom)` (line 88)
+- Eigendecomposition: `meta_rvprs_fixed.py:decompose_ld()` (lines 43–55)
 
 **MAF-weighted penalty** (optional, `weights` parameter): replaces the isotropic prior $\alpha \sim \mathcal{N}(0, \sigma_g I)$ with $\alpha \sim \mathcal{N}(0, \sigma_g W)$ where $W = \text{diag}(w_j)$, $w_j = (2p_j(1-p_j) + \varepsilon)^\gamma$. The BLUP becomes:
 
@@ -102,12 +165,16 @@ $$\hat\alpha = (L + \lambda\, W^{-1})^{-1}\, z_m$$
 
 In the eigenbasis of $L$, the penalty projects as $\tilde{w}_j^{-1} = \sum_i Q_{ij}^2 / w_i$ per eigencomponent.
 
+**Code:** `meta_rvprs_fixed.py:heels_blup_and_trace()` (lines 75–79)
+- Weight projection: `inv_w_eig = (ld.eigvec.T ** 2) @ (1/weights)` (line 78)
+- Weighted denom: `denom = ld.eigval + lam * inv_w_eig` (line 79)
+- Passed through `run_heels(..., weights=weights)` (line 106, forwarded at line 134)
+
 **Heritability:**
 
 $$h^2_{\text{corr}} = \frac{\sigma_g}{\sigma_g + \sigma_e}$$
 
-This is h2 under a **frequency-dependent** prior on raw effects:
-$\text{Var}(\beta_{\text{raw},j}) = \sigma_g / (m \cdot \text{Var}(G_j))$.
+**Code:** `meta_rvprs_fixed.py` line 171: `h2 = sigma_g / (sigma_g + sigma_e)`
 
 **Limitation:** On the correlation scale, all variants are treated as unit-variance features. For mixed-frequency variant sets (e.g., LoF with both rare and common variants), this distorts the relative ranking of effect sizes. The Spearman correlation with RareEffect remains ~0.48 regardless of $\lambda$ or MAF-weighting, because the rank distortion is embedded in the standardised z-scores and LD, not the penalty.
 
@@ -121,6 +188,10 @@ $\text{Var}(\beta_{\text{raw},j}) = \sigma_g / (m \cdot \text{Var}(G_j))$.
 
 $$U_c \text{ (raw scores)}, \quad \Lambda_c = C\, \Lambda\, C^\top \text{ (collapsed G'G)}, \quad \hat\sigma_Y^2 \text{ (estimated or provided)}$$
 
+**Code:** `preprocessing.py:build_heels_inputs()` (lines 651–667)
+- Raw scores: `z_m = summary['collapsed_score']` (line 656) — no z-score transformation
+- Raw G'G: `ld = collapsed.collapsed_gtg.toarray()` (line 654) — no n/m scaling
+
 **Model (matching RareEffect):**
 
 $$U_c = \Lambda_c\, \beta + \varepsilon, \quad \beta \sim \mathcal{N}(0,\, \tau\, I_m), \quad \varepsilon \sim \mathcal{N}(0,\, \sigma^2\, \Lambda_c)$$
@@ -129,17 +200,21 @@ where $\tau$ is the **per-variant effect variance** on the raw genotype scale (c
 
 **Three sufficient statistics from summary data:**
 
-| Quantity | Formula | Source |
+| Quantity | Formula | Code location |
 |---|---|---|
-| Eigenvalues $S$ of $\Lambda_c$ | $\text{eigh}(\Lambda_c)$ | G'G (LD files) |
-| Projections $\tilde{Y}_j = S_j^{-1/2} V_j^\top U_c$ | $S^{-1/2} V^\top \cdot \text{score}$ | Score stats + G'G |
-| Residual $\|Y_\perp\|^2 = n\hat\sigma_Y^2 - \sum_j \tilde{Y}_j^2$ | Requires $\hat\sigma_Y^2$ | Estimated from $V_j / \Lambda_{jj}$ |
+| Eigenvalues $S$ of $\Lambda_c$ | $\text{eigh}(\Lambda_c)$ | `meta_rvprs_fixed.py` lines 220–227 |
+| Projections $\tilde{Y}_j = S_j^{-1/2} V_j^\top U_c$ | $S^{-1/2} V^\top \cdot \text{score}$ | lines 230–231 |
+| Residual $\|Y_\perp\|^2 = n\hat\sigma_Y^2 - \sum_j \tilde{Y}_j^2$ | Requires $\hat\sigma_Y^2$ | lines 234–236 |
 
 **Why this works:** From the SVD $G = U_{\text{svd}}\, S^{1/2}\, V^\top$:
 
 $$U_{\text{svd}}^\top Y = S^{-1/2}\, V^\top\, G^\top Y = S^{-1/2}\, V^\top\, U_c$$
 
-So the projections $\tilde{Y}$ used by RareEffect's `calc_log_lik` are exactly recoverable from score statistics and the G'G eigendecomposition.
+So the projections $\tilde{Y}$ used by RareEffect's `calc_log_lik` are exactly recoverable from score statistics and the G'G eigendecomposition. This is implemented at `meta_rvprs_fixed.py` lines 229–231:
+```python
+VtU = V.T @ score          # V' G'Y
+UtY = VtU / np.sqrt(S)     # S^{-1/2} V' G'Y = U_svd' Y
+```
 
 **Profile log-likelihood** (optimised over $\delta = \sigma^2 / \tau$):
 
@@ -149,15 +224,34 @@ where
 
 $$\hat\sigma^2(\delta) = \frac{1}{n}\left[\sum_j \frac{\tilde{Y}_j^2}{S_j + \delta} + \frac{\|Y_\perp\|^2}{\delta}\right]$$
 
+**Code:** `meta_rvprs_fixed.py:_fastlmm_profile_loglik()` (lines 181–200)
+- `log_lik1 = sum(UtY**2 / (S + delta))` (line 194)
+- `log_lik2 = resid_yy / delta` (line 195)
+- `sigma_hat = (log_lik1 + log_lik2) / n` (line 196)
+- `log_det = sum(log(S + delta)) + (n-k)*log(delta)` (line 199)
+
+Matches RareEffect's `RVPRS_function.R:calc_log_lik()` (lines 188–202) term-by-term.
+
 **Optimisation:** Brent's method over $\delta \in [10^{-10},\, 10^{8}]$, maximising $\ell(\delta)$.
+
+**Code:** `meta_rvprs_fixed.py` lines 241–246:
+```python
+res = minimize_scalar(lambda d: -_fastlmm_profile_loglik(...), bounds=(1e-10, 1e8), method='bounded')
+```
 
 **Variance components:**
 
 $$\hat\sigma^2 = \hat\sigma^2(\hat\delta), \quad \hat\tau = \frac{\hat\sigma^2}{\hat\delta}$$
 
+**Code:** lines 249–252: `sigma_sq = (log_lik1 + log_lik2) / n`, `tau = sigma_sq / opt_delta`
+
 **BLUP:**
 
 $$\hat\beta = ({\Lambda_c + \hat\delta\, I})^{-1}\, U_c = V\, \text{diag}\!\left(\frac{V^\top U_c}{S_j + \hat\delta}\right)$$
+
+**Code:** line 255: `beta_hat = V @ (VtU / (S + opt_delta))`
+
+Matches RareEffect's `RVPRS_function.R:calc_post_beta()` (lines 205–212).
 
 **Heritability:**
 
@@ -165,11 +259,57 @@ $$h^2_{\text{cov}} = \frac{\hat\tau \cdot \text{tr}(\Lambda_c / n)}{\hat\tau \cd
 
 where $\text{tr}(\Lambda_c / n) = \sum_j \Lambda_{c,jj} / n \approx \sum_j \text{Var}(G_j)$ is the total genotypic variance.
 
-**Interpretation:** Constant per-variant effect prior (frequency-independent). Rarer variants do NOT get inflated priors. This matches RareEffect's FaST-LMM model exactly.
+**Code:** lines 258–260:
+```python
+tr_gtg_over_n = sum(diag(ld_gtg)) / n
+h2 = tau * tr_gtg_over_n / (tau * tr_gtg_over_n + sigma_sq)
+```
+
+Matches RareEffect's h2 formula in `ComputationEval.R` line 186:
+```r
+h2_lof_adj <- tau_lof_adj * tr_GtG_lof / (tau_lof_adj * tr_GtG_lof + sigma_sq * n_samples)
+```
+
+**Posterior variance:**
+
+$$\text{Var}(\hat\beta_j \mid \text{data}) = \hat\sigma^2 \cdot \left[\sum_\ell \frac{V_{j\ell}^2}{S_\ell + \hat\delta}\right]$$
+
+**Code:** lines 263–264:
+```python
+posterior_diag = sum((V**2) / (S + opt_delta), axis=1)
+posterior_var_diag = sigma_sq * posterior_diag
+```
 
 ---
 
-## 5. Relationship Between the Two Scales
+## 5. Pipeline Orchestration
+
+**Code:** `run_rvprs_pipeline.py:prepare_and_run_one_annotation()` (lines 34–104)
+
+The function routes to the appropriate estimator based on `genotype_scale`:
+
+```
+if genotype_scale == 'covariance':
+    yty_val = yty_over_n if yty_over_n is not None else 1.0
+    result = run_fastlmm_sumstats(score, ld_gtg, n, yty=yty_val)
+else:
+    ld = decompose_ld(ld_corr, rank=rank)
+    result = run_heels(z_m, ld, m, n, ...)
+```
+
+(lines 54–80)
+
+**Auto-estimation of yty:** In `main()` (lines 170–173):
+```python
+if yty_over_n is None and args.genotype_scale == 'covariance':
+    yty_over_n = estimate_yty_over_n(integrated)
+```
+
+This is computed once from the full integrated data and shared across all annotations.
+
+---
+
+## 6. Relationship Between the Two Scales
 
 ### Eigenvalue relationship
 
@@ -205,16 +345,6 @@ $$\sum_j \text{Var}(G_j) \ll m \quad \Longrightarrow \quad h^2_{\text{cov}} < h^
 
 ---
 
-## 6. Posterior Variance
-
-In both modes, the posterior variance of $\hat\beta_j$ is:
-
-$$\text{Var}(\hat\beta_j \mid \text{data}) = \sigma_{\text{noise}} \cdot \left[\sum_\ell \frac{V_{j\ell}^2}{S_\ell + \delta}\right]$$
-
-where $V$ are eigenvectors and $\sigma_{\text{noise}}$ is the relevant noise variance ($\sigma_e$ in correlation mode, $\hat\sigma^2$ in covariance mode).
-
----
-
 ## 7. Effect Size Scaling Between SAIGE and RareEffect
 
 The pipeline's effect sizes differ from RareEffect's by a constant factor:
@@ -225,11 +355,13 @@ This arises because SAIGE score statistics use $\sigma_{Y,\text{SAIGE}}^2 \appro
 
 **Heritability is unaffected** because both $\tau$ and $\sigma^2$ scale with $\sigma_Y^2$, so h2 = $\tau T / (\tau T + \sigma^2)$ is invariant when scores and $Y^\top Y/n$ are internally consistent.
 
+RareEffect's $\sigma^2$: `RareEffect.R` line 56: `sigma_sq <- var(modglmm$residuals)`
+
 ---
 
 ## 8. Empirical Validation: APOB, UKB WES 470k, f.30780.0.0 (LDL cholesterol)
 
-### Heritability (n ~ 299,265; covariance/MLE with yty = 1.028, binary collapse)
+### Heritability (n ~ 299,265; covariance/MLE with auto-estimated yty = 1.028, binary collapse)
 
 | Annotation | m | Pipeline h2 | RareEffect h2 | Ratio |
 |---|---:|---|---|---|
@@ -260,15 +392,21 @@ Profile-LL (covariance scale) matches RareEffect far better than HEELS-EM (corre
 
 ## 9. Implementation Reference
 
-| Component | File | Function |
-|---|---|---|
-| Meta-analytic integration | `preprocessing.py` | `integrate_summaries()` |
-| LD symmetry detection | `preprocessing.py` | `_is_symmetric_csr()` |
-| MAC collapsing + binary adjustment | `preprocessing.py` | `process_genetic_data()` |
-| G'G to correlation | `preprocessing.py` | `get_cor_sparse_py()` |
-| Phenotype variance estimation | `preprocessing.py` | `estimate_yty_over_n()` |
-| HEELS input construction | `preprocessing.py` | `build_heels_inputs()` |
-| HEELS-EM (correlation mode) | `meta_rvprs_fixed.py` | `run_heels()` |
-| FaST-LMM MLE (covariance mode) | `meta_rvprs_fixed.py` | `run_fastlmm_sumstats()` |
-| MAF-weighted shrinkage | `meta_rvprs_fixed.py` | `heels_blup_and_trace(weights=...)` |
-| Pipeline orchestration | `run_rvprs_pipeline.py` | `prepare_and_run_one_annotation()` |
+| Component | File | Function | Lines |
+|---|---|---|---|
+| Meta-analytic integration | `preprocessing.py` | `integrate_summaries()` | 260–363 |
+| LD symmetry detection | `preprocessing.py` | `_is_symmetric_csr()` | 214–221 |
+| LD loading + auto-detect | `preprocessing.py` | `load_ld_coo()` | 224–244 |
+| G'G to correlation | `preprocessing.py` | `get_cor_sparse_py()` | 366–383 |
+| Covariance to correlation | `preprocessing.py` | `covariance_to_correlation()` | 386–399 |
+| MAC collapsing + binary adj | `preprocessing.py` | `process_genetic_data()` | 479–586 |
+| Binary collapse rescaling | `preprocessing.py` | `_apply_binary_collapse_adjustment()` | 439–476 |
+| Phenotype variance estimation | `preprocessing.py` | `estimate_yty_over_n()` | 614–633 |
+| HEELS input construction | `preprocessing.py` | `build_heels_inputs()` | 636–683 |
+| LD eigendecomposition | `meta_rvprs_fixed.py` | `decompose_ld()` | 43–55 |
+| HEELS BLUP + trace | `meta_rvprs_fixed.py` | `heels_blup_and_trace()` | 58–90 |
+| HEELS-EM iteration | `meta_rvprs_fixed.py` | `run_heels()` | 93–178 |
+| Profile log-likelihood | `meta_rvprs_fixed.py` | `_fastlmm_profile_loglik()` | 181–200 |
+| FaST-LMM MLE (covariance) | `meta_rvprs_fixed.py` | `run_fastlmm_sumstats()` | 203–279 |
+| Pipeline orchestration | `run_rvprs_pipeline.py` | `prepare_and_run_one_annotation()` | 34–104 |
+| Auto yty + main loop | `run_rvprs_pipeline.py` | `main()` | 142–219 |
